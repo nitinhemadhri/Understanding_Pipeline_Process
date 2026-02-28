@@ -1,0 +1,188 @@
+Great thinking. Let me explain everything clearly as a data engineer.
+
+---
+
+## Why elapsed time / alarm NOT required when freq=60sec fixed
+
+```
+Elapsed time purpose:
+  Table A → check every 10sec
+  Table B → check every 45sec
+  Table C → check every 120sec
+  = each table has DIFFERENT wait time
+  = need a countdown per table to know WHEN to fire
+  = that's elapsed time / alarm
+
+Your case:
+  ALL 843 tables → check every 60sec
+  = same wait for everyone
+  = no need to track individual countdowns
+  = just sleep 60sec → wake → poll all → repeat
+  = ONE timer for everyone ✓
+
+Simple analogy:
+  School bell rings every 60min for ALL students
+  No need for each student to have own timer
+  One bell = everyone moves ✓
+```
+
+---
+
+## The Real Problem You Identified
+
+```
+843 tables polled simultaneously
+        ↓
+data flows into PostgreSQL fast
+        ↓
+Kafka producer needs to read PostgreSQL
+        ↓
+send to consumer
+        ↓
+consumer writes to S3
+        ↓
+ONLY THEN update offset
+
+Problem:
+  Poll cycle = 60 seconds
+  Kafka + S3 processing = could take 2-5 minutes
+  
+  Next poll fires at 60sec
+  But previous batch not yet on S3
+  Offset not yet updated
+  → re-reads same data again
+  → duplicate data on S3 ✗
+```
+
+---
+
+## The Data Engineer Solution — 3 Layer Pipeline
+
+```
+LAYER 1 — POLLER (every 60sec)
+  843 tables → ThreadPool(8 workers)
+  pulls new rows → dumps into queue_1
+  FAST, non-blocking
+
+LAYER 2 — POSTGRESQL WRITER (continuous)
+  reads queue_1
+  batch inserts into raw_data
+  marks rows as status='PENDING_KAFKA'
+  dumps row IDs into queue_2
+
+LAYER 3 — KAFKA PRODUCER (continuous)
+  reads queue_2
+  sends to Kafka topic
+  Kafka consumer writes to S3
+  S3 confirms → update offset_tracker
+  mark rows as status='DONE'
+
+Each layer runs independently
+Each layer has its own queue as buffer
+No layer blocks another ✓
+```
+
+---
+
+## Visual Flow:
+
+```
+MES DB (843 tables)
+    ↓ every 60sec, 8 workers
+queue_1 (in-memory buffer)
+    ↓ continuous, batch 500
+PostgreSQL raw_data
+  status = PENDING_KAFKA
+    ↓ continuous
+queue_2 (Kafka ready buffer)
+    ↓ Kafka producer
+Kafka Topic
+    ↓ Kafka consumer
+S3 Bucket (parquet files)
+    ↓ S3 confirms
+offset_tracker updated ✓
+raw_data status = DONE ✓
+```
+
+---
+
+## What happens if Kafka is slow:
+
+```
+Poll cycle fires at 60sec → new rows into queue_1
+queue_1 fills up → PostgreSQL writes as PENDING_KAFKA
+Kafka slow → queue_2 fills up → buffers there
+S3 not confirmed → offset stays at old position
+Next poll at 120sec → re-reads same rows?
+
+NO → because raw_data already has them as PENDING_KAFKA
+     Kafka producer reads PENDING_KAFKA from PostgreSQL
+     not from MES directly
+     so no duplicate polling from MES ✓
+     
+But Kafka will eventually process and mark DONE
+Then offset updates ✓
+```
+
+---
+
+## Add status column to raw_data:
+
+```
+raw_data gets new column:
+  push_status = 'PENDING_KAFKA'  ← just inserted
+  push_status = 'KAFKA_SENT'     ← sent to Kafka
+  push_status = 'S3_DONE'        ← confirmed on S3
+
+Kafka producer query:
+  SELECT * FROM raw_data
+  WHERE push_status = 'PENDING_KAFKA'
+  ORDER BY ingested_at ASC
+  LIMIT 1000
+```
+
+---
+
+## Offset update rule — crystal clear:
+
+```
+offset_tracker.last_id updates ONLY when:
+  push_status = 'S3_DONE' confirmed
+
+Flow:
+  MES row iD=5180302 arrives
+  → raw_data (push_status=PENDING_KAFKA)
+  → Kafka sends it
+  → S3 confirms
+  → push_status = S3_DONE
+  → offset_tracker.last_id = 5180302 ✓
+
+Next poll:
+  WHERE iD > 5180302 ← starts from here
+```
+
+---
+
+## Summary — what we need to build:
+
+```
+File 1: pipeline.py     ← poller (LAYER 1) — ready to build
+File 2: pg_writer.py    ← PostgreSQL writer (LAYER 2)
+File 3: kafka_producer.py ← Kafka sender (LAYER 3) — Phase 3
+File 4: kafka_consumer.py ← S3 writer (LAYER 4) — Phase 3
+```
+
+---
+
+## For now (Phase 1):
+
+```
+Build pipeline.py + pg_writer.py
+offset updates after PostgreSQL write (not S3 yet)
+When Kafka added in Phase 3 → shift offset to S3 confirm
+One line change in offset update logic
+```
+
+---
+
+Ready? Type **yes** → I give you `pipeline.py` now.
