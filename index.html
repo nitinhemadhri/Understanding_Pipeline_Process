@@ -1,188 +1,1036 @@
-Great thinking. Let me explain everything clearly as a data engineer.
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MES → S3 Data Pipeline</title>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Syne:wght@400;700;800&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #0a0c10;
+    --surface: #111520;
+    --border: #1e2535;
+    --accent1: #00e5ff;
+    --accent2: #7c3aed;
+    --accent3: #10b981;
+    --accent4: #f59e0b;
+    --text: #e2e8f0;
+    --muted: #64748b;
+    --danger: #ef4444;
+  }
 
----
+  * { margin: 0; padding: 0; box-sizing: border-box; }
 
-## Why elapsed time / alarm NOT required when freq=60sec fixed
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Syne', sans-serif;
+    min-height: 100vh;
+    overflow-x: hidden;
+  }
 
-```
-Elapsed time purpose:
-  Table A → check every 10sec
-  Table B → check every 45sec
-  Table C → check every 120sec
-  = each table has DIFFERENT wait time
-  = need a countdown per table to know WHEN to fire
-  = that's elapsed time / alarm
+  /* grid bg */
+  body::before {
+    content: '';
+    position: fixed; inset: 0;
+    background-image: 
+      linear-gradient(rgba(0,229,255,0.03) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(0,229,255,0.03) 1px, transparent 1px);
+    background-size: 40px 40px;
+    pointer-events: none;
+  }
 
-Your case:
-  ALL 843 tables → check every 60sec
-  = same wait for everyone
-  = no need to track individual countdowns
-  = just sleep 60sec → wake → poll all → repeat
-  = ONE timer for everyone ✓
+  header {
+    padding: 48px 40px 24px;
+    border-bottom: 1px solid var(--border);
+  }
 
-Simple analogy:
-  School bell rings every 60min for ALL students
-  No need for each student to have own timer
-  One bell = everyone moves ✓
-```
+  header h1 {
+    font-size: clamp(2rem, 5vw, 3.5rem);
+    font-weight: 800;
+    letter-spacing: -2px;
+    background: linear-gradient(135deg, var(--accent1), var(--accent2));
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+  }
 
----
+  header p {
+    font-family: 'JetBrains Mono', monospace;
+    color: var(--muted);
+    font-size: 0.85rem;
+    margin-top: 8px;
+  }
 
-## The Real Problem You Identified
+  .nav-tabs {
+    display: flex;
+    gap: 4px;
+    padding: 24px 40px 0;
+    border-bottom: 1px solid var(--border);
+  }
 
-```
-843 tables polled simultaneously
-        ↓
-data flows into PostgreSQL fast
-        ↓
-Kafka producer needs to read PostgreSQL
-        ↓
-send to consumer
-        ↓
-consumer writes to S3
-        ↓
-ONLY THEN update offset
+  .tab {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.8rem;
+    padding: 10px 20px;
+    background: transparent;
+    border: 1px solid var(--border);
+    border-bottom: none;
+    color: var(--muted);
+    cursor: pointer;
+    border-radius: 6px 6px 0 0;
+    transition: all 0.2s;
+    position: relative;
+    bottom: -1px;
+  }
 
-Problem:
-  Poll cycle = 60 seconds
-  Kafka + S3 processing = could take 2-5 minutes
-  
-  Next poll fires at 60sec
-  But previous batch not yet on S3
-  Offset not yet updated
-  → re-reads same data again
-  → duplicate data on S3 ✗
-```
+  .tab.active {
+    background: var(--surface);
+    color: var(--accent1);
+    border-color: var(--border);
+    border-bottom-color: var(--surface);
+  }
 
----
+  .tab:hover:not(.active) { color: var(--text); background: #151b28; }
 
-## The Data Engineer Solution — 3 Layer Pipeline
+  .content { display: none; padding: 40px; }
+  .content.active { display: block; }
 
-```
-LAYER 1 — POLLER (every 60sec)
-  843 tables → ThreadPool(8 workers)
-  pulls new rows → dumps into queue_1
-  FAST, non-blocking
+  /* ===== TAB 1: WHY NO TIMER ===== */
+  .comparison-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 24px;
+    margin-bottom: 40px;
+  }
 
-LAYER 2 — POSTGRESQL WRITER (continuous)
-  reads queue_1
-  batch inserts into raw_data
-  marks rows as status='PENDING_KAFKA'
-  dumps row IDs into queue_2
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 28px;
+  }
 
-LAYER 3 — KAFKA PRODUCER (continuous)
-  reads queue_2
-  sends to Kafka topic
-  Kafka consumer writes to S3
-  S3 confirms → update offset_tracker
-  mark rows as status='DONE'
+  .card.bad { border-left: 3px solid var(--danger); }
+  .card.good { border-left: 3px solid var(--accent3); }
 
-Each layer runs independently
-Each layer has its own queue as buffer
-No layer blocks another ✓
-```
+  .card-label {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.7rem;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    margin-bottom: 16px;
+  }
+  .bad .card-label { color: var(--danger); }
+  .good .card-label { color: var(--accent3); }
 
----
+  .card h3 { font-size: 1.1rem; margin-bottom: 12px; }
 
-## Visual Flow:
+  .timer-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 8px 0;
+    border-bottom: 1px solid var(--border);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.8rem;
+  }
+  .timer-row:last-child { border: none; }
 
-```
-MES DB (843 tables)
-    ↓ every 60sec, 8 workers
-queue_1 (in-memory buffer)
-    ↓ continuous, batch 500
-PostgreSQL raw_data
-  status = PENDING_KAFKA
-    ↓ continuous
-queue_2 (Kafka ready buffer)
-    ↓ Kafka producer
-Kafka Topic
-    ↓ Kafka consumer
-S3 Bucket (parquet files)
-    ↓ S3 confirms
-offset_tracker updated ✓
-raw_data status = DONE ✓
-```
+  .countdown {
+    background: #1a0a0a;
+    border: 1px solid var(--danger);
+    border-radius: 4px;
+    padding: 2px 8px;
+    color: var(--danger);
+    font-size: 0.75rem;
+    animation: blink 1s infinite;
+  }
 
----
+  @keyframes blink { 50% { opacity: 0.4; } }
 
-## What happens if Kafka is slow:
+  .bell-visual {
+    text-align: center;
+    padding: 32px;
+    background: linear-gradient(135deg, #0d1a12, #0d1220);
+    border-radius: 12px;
+    border: 1px solid var(--border);
+    font-size: 3rem;
+    margin-top: 12px;
+  }
 
-```
-Poll cycle fires at 60sec → new rows into queue_1
-queue_1 fills up → PostgreSQL writes as PENDING_KAFKA
-Kafka slow → queue_2 fills up → buffers there
-S3 not confirmed → offset stays at old position
-Next poll at 120sec → re-reads same rows?
+  .bell-visual p {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.8rem;
+    color: var(--accent3);
+    margin-top: 12px;
+  }
 
-NO → because raw_data already has them as PENDING_KAFKA
-     Kafka producer reads PENDING_KAFKA from PostgreSQL
-     not from MES directly
-     so no duplicate polling from MES ✓
-     
-But Kafka will eventually process and mark DONE
-Then offset updates ✓
-```
+  /* ===== TAB 2: PIPELINE FLOW ===== */
+  .pipeline-wrapper {
+    position: relative;
+  }
 
----
+  .pipeline-stages {
+    display: flex;
+    flex-direction: column;
+    gap: 0;
+  }
 
-## Add status column to raw_data:
+  .stage {
+    display: grid;
+    grid-template-columns: 180px 1fr;
+    gap: 24px;
+    padding: 28px 0;
+    border-bottom: 1px solid var(--border);
+    animation: fadeSlide 0.5s ease forwards;
+    opacity: 0;
+  }
 
-```
-raw_data gets new column:
-  push_status = 'PENDING_KAFKA'  ← just inserted
-  push_status = 'KAFKA_SENT'     ← sent to Kafka
-  push_status = 'S3_DONE'        ← confirmed on S3
+  @keyframes fadeSlide {
+    from { opacity: 0; transform: translateX(-20px); }
+    to { opacity: 1; transform: translateX(0); }
+  }
 
-Kafka producer query:
-  SELECT * FROM raw_data
-  WHERE push_status = 'PENDING_KAFKA'
-  ORDER BY ingested_at ASC
-  LIMIT 1000
-```
+  .stage:nth-child(1) { animation-delay: 0.1s; }
+  .stage:nth-child(2) { animation-delay: 0.25s; }
+  .stage:nth-child(3) { animation-delay: 0.4s; }
+  .stage:nth-child(4) { animation-delay: 0.55s; }
 
----
+  .stage-badge {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 8px;
+  }
 
-## Offset update rule — crystal clear:
+  .layer-num {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.65rem;
+    letter-spacing: 3px;
+    color: var(--muted);
+    text-transform: uppercase;
+  }
 
-```
-offset_tracker.last_id updates ONLY when:
-  push_status = 'S3_DONE' confirmed
+  .layer-name {
+    font-size: 1rem;
+    font-weight: 700;
+    padding: 6px 14px;
+    border-radius: 6px;
+    white-space: nowrap;
+  }
 
-Flow:
-  MES row iD=5180302 arrives
-  → raw_data (push_status=PENDING_KAFKA)
-  → Kafka sends it
-  → S3 confirms
-  → push_status = S3_DONE
-  → offset_tracker.last_id = 5180302 ✓
+  .l1 { background: rgba(0,229,255,0.15); color: var(--accent1); border: 1px solid rgba(0,229,255,0.3); }
+  .l2 { background: rgba(124,58,237,0.15); color: #a78bfa; border: 1px solid rgba(124,58,237,0.3); }
+  .l3 { background: rgba(16,185,129,0.15); color: var(--accent3); border: 1px solid rgba(16,185,129,0.3); }
+  .l4 { background: rgba(245,158,11,0.15); color: var(--accent4); border: 1px solid rgba(245,158,11,0.3); }
 
-Next poll:
-  WHERE iD > 5180302 ← starts from here
-```
+  .stage-detail h4 {
+    font-size: 0.95rem;
+    margin-bottom: 8px;
+    color: var(--text);
+  }
 
----
+  .stage-detail p {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.78rem;
+    color: var(--muted);
+    line-height: 1.7;
+  }
 
-## Summary — what we need to build:
+  .stage-detail .highlight {
+    color: var(--accent1);
+  }
 
-```
-File 1: pipeline.py     ← poller (LAYER 1) — ready to build
-File 2: pg_writer.py    ← PostgreSQL writer (LAYER 2)
-File 3: kafka_producer.py ← Kafka sender (LAYER 3) — Phase 3
-File 4: kafka_consumer.py ← S3 writer (LAYER 4) — Phase 3
-```
+  .arrow-down {
+    text-align: center;
+    color: var(--muted);
+    font-size: 1.5rem;
+    padding: 4px 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.7rem;
+    color: var(--muted);
+  }
 
----
+  .queue-box {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    background: #0f1624;
+    border: 1px dashed var(--border);
+    border-radius: 6px;
+    padding: 8px 16px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.75rem;
+    color: var(--accent4);
+    margin: 4px 0;
+  }
 
-## For now (Phase 1):
+  .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--accent4); animation: pulse 1.5s infinite; }
+  @keyframes pulse { 50% { opacity: 0.2; } }
 
-```
-Build pipeline.py + pg_writer.py
-offset updates after PostgreSQL write (not S3 yet)
-When Kafka added in Phase 3 → shift offset to S3 confirm
-One line change in offset update logic
-```
+  /* ===== TAB 3: DUPLICATE PROBLEM ===== */
+  .problem-scenario {
+    background: var(--surface);
+    border: 1px solid var(--danger);
+    border-radius: 12px;
+    padding: 28px;
+    margin-bottom: 24px;
+  }
 
----
+  .timeline {
+    position: relative;
+    padding-left: 28px;
+    margin-top: 16px;
+  }
 
-Ready? Type **yes** → I give you `pipeline.py` now.
+  .timeline::before {
+    content: '';
+    position: absolute;
+    left: 8px; top: 0; bottom: 0;
+    width: 2px;
+    background: var(--border);
+  }
+
+  .tl-item {
+    position: relative;
+    padding: 10px 0 10px 16px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.78rem;
+    line-height: 1.6;
+    color: var(--muted);
+    border-bottom: 1px solid #1a1f2e;
+  }
+
+  .tl-item::before {
+    content: '';
+    position: absolute;
+    left: -22px; top: 16px;
+    width: 10px; height: 10px;
+    border-radius: 50%;
+    border: 2px solid var(--border);
+    background: var(--bg);
+  }
+
+  .tl-item.ok::before { border-color: var(--accent3); background: var(--accent3); }
+  .tl-item.warn::before { border-color: var(--accent4); background: var(--accent4); }
+  .tl-item.err::before { border-color: var(--danger); background: var(--danger); }
+
+  .tl-item .time {
+    display: inline-block;
+    background: #1a0e0e;
+    color: var(--accent4);
+    padding: 1px 8px;
+    border-radius: 3px;
+    margin-right: 8px;
+    font-size: 0.7rem;
+  }
+
+  .solution-box {
+    background: linear-gradient(135deg, #0d1a12, #0a1220);
+    border: 1px solid var(--accent3);
+    border-radius: 12px;
+    padding: 28px;
+  }
+
+  .solution-box h3 { color: var(--accent3); margin-bottom: 16px; }
+
+  /* ===== TAB 4: STATUS STATES ===== */
+  .status-flow {
+    display: flex;
+    align-items: center;
+    gap: 0;
+    margin: 32px 0;
+    overflow-x: auto;
+    padding-bottom: 8px;
+  }
+
+  .status-node {
+    flex-shrink: 0;
+    text-align: center;
+    min-width: 160px;
+  }
+
+  .status-badge {
+    display: inline-block;
+    padding: 10px 18px;
+    border-radius: 8px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.75rem;
+    font-weight: 700;
+    cursor: pointer;
+    transition: transform 0.2s, box-shadow 0.2s;
+  }
+
+  .status-badge:hover { transform: translateY(-3px); }
+
+  .s-pending { background: rgba(245,158,11,0.15); color: var(--accent4); border: 1px solid var(--accent4); }
+  .s-sent { background: rgba(124,58,237,0.15); color: #a78bfa; border: 1px solid #7c3aed; }
+  .s-done { background: rgba(16,185,129,0.15); color: var(--accent3); border: 1px solid var(--accent3); }
+
+  .status-node p {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.68rem;
+    color: var(--muted);
+    margin-top: 8px;
+    padding: 0 8px;
+  }
+
+  .status-arrow {
+    flex-shrink: 0;
+    color: var(--muted);
+    font-size: 1.2rem;
+    padding: 0 4px;
+  }
+
+  .status-detail-panel {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 24px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.8rem;
+    line-height: 1.8;
+    min-height: 120px;
+    transition: all 0.3s;
+  }
+
+  .code-block {
+    background: #080b12;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 20px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.78rem;
+    line-height: 1.9;
+    color: var(--muted);
+    overflow-x: auto;
+    margin: 16px 0;
+  }
+
+  .code-block .kw { color: #7c3aed; }
+  .code-block .str { color: var(--accent3); }
+  .code-block .cmt { color: #3d4f6b; }
+  .code-block .fn { color: var(--accent1); }
+  .code-block .num { color: var(--accent4); }
+
+  /* ===== TAB 5: INTERACTIVE SIM ===== */
+  .sim-container {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 24px;
+  }
+
+  .sim-controls {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 24px;
+  }
+
+  .sim-controls h3 {
+    font-size: 0.9rem;
+    margin-bottom: 20px;
+    color: var(--muted);
+    font-family: 'JetBrains Mono', monospace;
+    text-transform: uppercase;
+    letter-spacing: 2px;
+  }
+
+  .control-group {
+    margin-bottom: 20px;
+  }
+
+  .control-group label {
+    display: block;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.75rem;
+    color: var(--muted);
+    margin-bottom: 8px;
+  }
+
+  .control-group label span {
+    color: var(--accent1);
+    float: right;
+  }
+
+  input[type=range] {
+    width: 100%;
+    -webkit-appearance: none;
+    height: 4px;
+    background: var(--border);
+    border-radius: 2px;
+    outline: none;
+  }
+
+  input[type=range]::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    width: 16px; height: 16px;
+    border-radius: 50%;
+    background: var(--accent1);
+    cursor: pointer;
+  }
+
+  .sim-btn {
+    width: 100%;
+    padding: 12px;
+    background: linear-gradient(135deg, var(--accent1), var(--accent2));
+    border: none;
+    border-radius: 8px;
+    color: #000;
+    font-family: 'Syne', sans-serif;
+    font-weight: 700;
+    font-size: 0.9rem;
+    cursor: pointer;
+    margin-top: 8px;
+    transition: opacity 0.2s;
+  }
+
+  .sim-btn:hover { opacity: 0.85; }
+  .sim-btn.stop { background: linear-gradient(135deg, var(--danger), #7f1d1d); color: #fff; }
+
+  .sim-display {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 24px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+
+  .meter-row {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .meter-label {
+    display: flex;
+    justify-content: space-between;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.72rem;
+    color: var(--muted);
+  }
+
+  .meter-label span:last-child { color: var(--accent1); }
+
+  .meter-bar {
+    height: 8px;
+    background: var(--border);
+    border-radius: 4px;
+    overflow: hidden;
+  }
+
+  .meter-fill {
+    height: 100%;
+    border-radius: 4px;
+    transition: width 0.5s ease;
+  }
+
+  .m-cyan { background: var(--accent1); }
+  .m-purple { background: #7c3aed; }
+  .m-green { background: var(--accent3); }
+  .m-amber { background: var(--accent4); }
+
+  .sim-log {
+    background: #080b12;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.72rem;
+    height: 200px;
+    overflow-y: auto;
+    grid-column: 1 / -1;
+    line-height: 1.8;
+  }
+
+  .log-entry { color: var(--muted); }
+  .log-entry.ok { color: var(--accent3); }
+  .log-entry.warn { color: var(--accent4); }
+  .log-entry.err { color: var(--danger); }
+  .log-entry.info { color: var(--accent1); }
+
+  /* Offset tracker visual */
+  .offset-display {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.85rem;
+    padding: 12px 16px;
+    background: #080b12;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-top: 8px;
+  }
+
+  .offset-display .label { color: var(--muted); font-size: 0.7rem; }
+  .offset-display .value { color: var(--accent1); font-weight: 700; }
+
+  /* responsive */
+  @media (max-width: 768px) {
+    .comparison-grid, .sim-container { grid-template-columns: 1fr; }
+    .nav-tabs { flex-wrap: wrap; }
+    .status-flow { gap: 8px; }
+    header, .content { padding: 24px 20px; }
+    .nav-tabs { padding: 16px 20px 0; }
+    .stage { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>MES → S3 Data Pipeline</h1>
+  <p>// 843 tables · 3-layer architecture · zero duplicates</p>
+</header>
+
+<div class="nav-tabs">
+  <button class="tab active" onclick="switchTab('why')">01 · Why No Timer</button>
+  <button class="tab" onclick="switchTab('pipeline')">02 · Pipeline Layers</button>
+  <button class="tab" onclick="switchTab('problem')">03 · Duplicate Problem</button>
+  <button class="tab" onclick="switchTab('status')">04 · Status States</button>
+  <button class="tab" onclick="switchTab('sim')">05 · Live Simulation</button>
+</div>
+
+<!-- TAB 1: WHY NO TIMER -->
+<div id="tab-why" class="content active">
+  <div class="comparison-grid">
+    <div class="card bad">
+      <div class="card-label">❌ Different frequencies — need timers</div>
+      <h3>Variable Interval Polling</h3>
+      <div class="timer-row">
+        <span style="flex:1;color:var(--text)">Table A</span>
+        <span class="countdown">10s</span>
+        <span style="color:var(--muted);font-family:monospace;font-size:0.75rem">every 10 sec</span>
+      </div>
+      <div class="timer-row">
+        <span style="flex:1;color:var(--text)">Table B</span>
+        <span class="countdown" style="animation-delay:0.3s">45s</span>
+        <span style="color:var(--muted);font-family:monospace;font-size:0.75rem">every 45 sec</span>
+      </div>
+      <div class="timer-row">
+        <span style="flex:1;color:var(--text)">Table C</span>
+        <span class="countdown" style="animation-delay:0.6s">120s</span>
+        <span style="color:var(--muted);font-family:monospace;font-size:0.75rem">every 120 sec</span>
+      </div>
+      <p style="margin-top:16px;font-family:monospace;font-size:0.75rem;color:var(--muted)">
+        → Each table needs its own countdown<br>
+        → Complex elapsed time tracking<br>
+        → alarm per table = overhead
+      </p>
+    </div>
+
+    <div class="card good">
+      <div class="card-label">✅ Same frequency — one bell</div>
+      <h3>Fixed 60s Interval for ALL 843 Tables</h3>
+      <div class="bell-visual">
+        🔔
+        <p>ONE bell rings every 60s<br>ALL 843 tables wake up together</p>
+      </div>
+      <p style="margin-top:16px;font-family:monospace;font-size:0.75rem;color:var(--muted)">
+        → sleep(60) → wake → poll all → repeat<br>
+        → No per-table countdown needed<br>
+        → Simple, clean, zero overhead
+      </p>
+    </div>
+  </div>
+
+  <div class="card" style="background:linear-gradient(135deg,#0d1a12,#0a1220);border-color:var(--accent3)">
+    <div style="font-family:monospace;font-size:0.78rem;color:var(--muted)">
+      <span style="color:var(--accent3)">// School bell analogy</span><br><br>
+      If every class changes at the SAME time (every 60 min)<br>
+      → ONE school bell handles everything<br>
+      → No student needs their own personal timer<br><br>
+      <span style="color:var(--accent1)">Your system:</span> 843 tables, all polled at T=0, T=60, T=120...<br>
+      <span style="color:var(--accent3)">= single sleep(60) loop is sufficient ✓</span>
+    </div>
+  </div>
+</div>
+
+<!-- TAB 2: PIPELINE LAYERS -->
+<div id="tab-pipeline" class="content">
+  <div class="pipeline-stages">
+    <div class="stage">
+      <div class="stage-badge">
+        <span class="layer-num">Layer 01</span>
+        <span class="layer-name l1">POLLER</span>
+        <code style="font-size:0.65rem;color:var(--muted)">pipeline.py</code>
+      </div>
+      <div class="stage-detail">
+        <h4>MES DB → Queue 1</h4>
+        <p>
+          Every <span class="highlight">60 seconds</span>, poll <span class="highlight">843 tables</span><br>
+          Uses <span class="highlight">ThreadPool(8 workers)</span> — all tables in parallel<br>
+          Fast, non-blocking → dumps rows into <span class="highlight">queue_1</span><br>
+          Does NOT wait for PostgreSQL or Kafka<br><br>
+          <span style="color:var(--accent3)">→ Just reads and hands off. That's it.</span>
+        </p>
+      </div>
+    </div>
+
+    <div style="padding:8px 0 8px 206px">
+      <div class="queue-box"><div class="dot"></div> queue_1 · in-memory buffer · fast handoff</div>
+    </div>
+
+    <div class="stage">
+      <div class="stage-badge">
+        <span class="layer-num">Layer 02</span>
+        <span class="layer-name l2">PG WRITER</span>
+        <code style="font-size:0.65rem;color:var(--muted)">pg_writer.py</code>
+      </div>
+      <div class="stage-detail">
+        <h4>Queue 1 → PostgreSQL raw_data</h4>
+        <p>
+          Runs <span class="highlight">continuously</span>, reads from queue_1<br>
+          Batch inserts into <span class="highlight">raw_data</span> table<br>
+          Sets <span class="highlight">push_status = 'PENDING_KAFKA'</span><br>
+          Dumps row IDs into <span class="highlight">queue_2</span><br><br>
+          <span style="color:#a78bfa">→ Acts as durable buffer. If Kafka dies, data is safe in PG.</span>
+        </p>
+      </div>
+    </div>
+
+    <div style="padding:8px 0 8px 206px">
+      <div class="queue-box" style="color:var(--accent3);border-color:rgba(16,185,129,0.3)"><div class="dot" style="background:var(--accent3)"></div> queue_2 · Kafka-ready buffer</div>
+    </div>
+
+    <div class="stage">
+      <div class="stage-badge">
+        <span class="layer-num">Layer 03</span>
+        <span class="layer-name l3">KAFKA PROD</span>
+        <code style="font-size:0.65rem;color:var(--muted)">kafka_producer.py</code>
+      </div>
+      <div class="stage-detail">
+        <h4>Queue 2 → Kafka Topic</h4>
+        <p>
+          Reads from queue_2, sends to <span class="highlight">Kafka topic</span><br>
+          Runs continuously, independent of poller<br>
+          If Kafka is slow → queue_2 buffers the backlog<br>
+          Sets <span class="highlight">push_status = 'KAFKA_SENT'</span><br><br>
+          <span style="color:var(--accent3)">→ Decoupled. Poller never waits for Kafka.</span>
+        </p>
+      </div>
+    </div>
+
+    <div style="padding:8px 0 8px 206px">
+      <div class="queue-box" style="color:var(--accent4);border-color:rgba(245,158,11,0.3)"><div class="dot" style="background:var(--accent4)"></div> Kafka Topic → consumer reads</div>
+    </div>
+
+    <div class="stage">
+      <div class="stage-badge">
+        <span class="layer-num">Layer 04</span>
+        <span class="layer-name l4">S3 WRITER</span>
+        <code style="font-size:0.65rem;color:var(--muted)">kafka_consumer.py</code>
+      </div>
+      <div class="stage-detail">
+        <h4>Kafka Consumer → S3 → Offset Update</h4>
+        <p>
+          Reads from Kafka, writes <span class="highlight">parquet files to S3</span><br>
+          On S3 confirm → sets <span class="highlight">push_status = 'S3_DONE'</span><br>
+          <span class="highlight">ONLY NOW</span> updates offset_tracker.last_id<br>
+          This is the source of truth for "what's done"<br><br>
+          <span style="color:var(--accent4)">→ Offset only moves when data lands safely on S3.</span>
+        </p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- TAB 3: DUPLICATE PROBLEM -->
+<div id="tab-problem" class="content">
+  <div class="problem-scenario">
+    <div style="font-family:monospace;font-size:0.8rem;color:var(--danger);margin-bottom:16px;letter-spacing:1px">❌ THE RACE CONDITION — WITHOUT 3-LAYER DESIGN</div>
+    <div class="timeline">
+      <div class="tl-item ok"><span class="time">T=0s</span> Poll fires. Read rows from MES where ID > last_id=5180000</div>
+      <div class="tl-item ok"><span class="time">T=2s</span> 843 tables polled. 15,000 new rows collected.</div>
+      <div class="tl-item warn"><span class="time">T=5s</span> Sending to Kafka... Kafka is under load. Processing slowly.</div>
+      <div class="tl-item warn"><span class="time">T=60s</span> ⚠️ Next poll fires! Offset NOT updated yet (Kafka still processing).</div>
+      <div class="tl-item err"><span class="time">T=62s</span> Reads SAME rows again → WHERE ID > 5180000 (unchanged!)</div>
+      <div class="tl-item err"><span class="time">T=65s</span> 💥 Duplicate rows sent to Kafka → S3 gets duplicates!</div>
+    </div>
+  </div>
+
+  <div class="solution-box">
+    <h3>✅ HOW THE 3-LAYER DESIGN SOLVES THIS</h3>
+    <div class="timeline" style="margin-top:0">
+      <div class="tl-item ok"><span class="time">T=0s</span> Poll fires → reads from MES WHERE ID > last_id=5180000</div>
+      <div class="tl-item ok"><span class="time">T=2s</span> Rows dropped into queue_1. Poller's job is DONE.</div>
+      <div class="tl-item ok"><span class="time">T=3s</span> PG Writer reads queue_1 → inserts into raw_data with push_status='PENDING_KAFKA'</div>
+      <div class="tl-item warn"><span class="time">T=60s</span> Next poll fires. Reads MES again WHERE ID > last_id (still 5180000)</div>
+      <div class="tl-item ok"><span class="time">T=62s</span> New rows from MES land in raw_data as PENDING_KAFKA</div>
+      <div class="tl-item ok"><span class="time">T=90s</span> Kafka producer reads PENDING_KAFKA rows from PG. Sends them.</div>
+      <div class="tl-item ok"><span class="time">T=95s</span> S3 confirms. push_status → 'S3_DONE'. offset_tracker.last_id → 5180302</div>
+      <div class="tl-item ok"><span class="time">T=120s</span> Next poll: WHERE ID > 5180302 ✓ No duplicates.</div>
+    </div>
+  </div>
+
+  <div class="code-block" style="margin-top:24px">
+    <span class="cmt">-- Kafka producer NEVER reads from MES directly</span><br>
+    <span class="cmt">-- It reads from PostgreSQL where push_status = 'PENDING_KAFKA'</span><br><br>
+    <span class="kw">SELECT</span> * <span class="kw">FROM</span> raw_data<br>
+    <span class="kw">WHERE</span> push_status = <span class="str">'PENDING_KAFKA'</span><br>
+    <span class="kw">ORDER BY</span> ingested_at <span class="kw">ASC</span><br>
+    <span class="kw">LIMIT</span> <span class="num">1000</span>;<br><br>
+    <span class="cmt">-- PostgreSQL acts as the durable buffer between polling and Kafka</span><br>
+    <span class="cmt">-- No matter how slow Kafka is, MES data is already safe in PG</span>
+  </div>
+</div>
+
+<!-- TAB 4: STATUS STATES -->
+<div id="tab-status" class="content">
+  <p style="color:var(--muted);font-family:monospace;font-size:0.8rem;margin-bottom:8px">Click each status to see what triggers it →</p>
+
+  <div class="status-flow">
+    <div class="status-node">
+      <div class="status-badge s-pending" onclick="showStatus('pending')">PENDING_KAFKA</div>
+      <p>Row just landed in PostgreSQL from poller</p>
+    </div>
+    <div class="status-arrow">→</div>
+    <div class="status-node">
+      <div class="status-badge s-sent" onclick="showStatus('sent')">KAFKA_SENT</div>
+      <p>Kafka producer picked it up and sent to topic</p>
+    </div>
+    <div class="status-arrow">→</div>
+    <div class="status-node">
+      <div class="status-badge s-done" onclick="showStatus('done')">S3_DONE</div>
+      <p>Consumer wrote parquet to S3 and confirmed</p>
+    </div>
+  </div>
+
+  <div class="status-detail-panel" id="status-panel">
+    <span style="color:var(--muted)">👆 Click a status badge above to see details</span>
+  </div>
+
+  <h3 style="margin: 32px 0 16px;font-size:1rem">Offset Update Rule</h3>
+  <div class="code-block">
+    <span class="cmt">-- offset_tracker.last_id updates ONLY when S3_DONE confirmed</span><br><br>
+    <span class="cmt">-- Row lifecycle:</span><br>
+    MES iD=<span class="num">5180302</span> arrives<br>
+    → raw_data (push_status=<span class="str">'PENDING_KAFKA'</span>)<br>
+    → Kafka sends it  → push_status=<span class="str">'KAFKA_SENT'</span><br>
+    → S3 confirms     → push_status=<span class="str">'S3_DONE'</span><br>
+    → <span class="fn">UPDATE</span> offset_tracker <span class="kw">SET</span> last_id = <span class="num">5180302</span><br><br>
+    <span class="cmt">-- Next poll query becomes:</span><br>
+    <span class="kw">SELECT</span> * <span class="kw">FROM</span> mes_table <span class="kw">WHERE</span> iD > <span class="num">5180302</span>
+  </div>
+
+  <h3 style="margin: 32px 0 16px;font-size:1rem">raw_data Table Schema</h3>
+  <div class="code-block">
+    <span class="kw">CREATE TABLE</span> raw_data (<br>
+    &nbsp;&nbsp;id&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span class="fn">BIGSERIAL</span> <span class="kw">PRIMARY KEY</span>,<br>
+    &nbsp;&nbsp;source_table&nbsp;&nbsp;<span class="fn">TEXT</span>,<br>
+    &nbsp;&nbsp;source_id&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span class="fn">BIGINT</span>,&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span class="cmt">-- original MES row ID</span><br>
+    &nbsp;&nbsp;payload&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span class="fn">JSONB</span>,<br>
+    &nbsp;&nbsp;ingested_at&nbsp;&nbsp;&nbsp;<span class="fn">TIMESTAMPTZ</span> <span class="kw">DEFAULT NOW</span>(),<br>
+    &nbsp;&nbsp;push_status&nbsp;&nbsp;&nbsp;<span class="fn">TEXT</span> <span class="kw">DEFAULT</span> <span class="str">'PENDING_KAFKA'</span>&nbsp;<span class="cmt">-- ← state machine</span><br>
+    );
+  </div>
+</div>
+
+<!-- TAB 5: SIMULATION -->
+<div id="tab-sim" class="content">
+  <div class="sim-container">
+    <div class="sim-controls">
+      <h3>// Simulation Controls</h3>
+
+      <div class="control-group">
+        <label>Tables to poll <span id="lbl-tables">843</span></label>
+        <input type="range" id="ctrl-tables" min="100" max="843" value="843" oninput="document.getElementById('lbl-tables').textContent=this.value">
+      </div>
+
+      <div class="control-group">
+        <label>Kafka processing speed <span id="lbl-kafka">Normal</span></label>
+        <input type="range" id="ctrl-kafka" min="1" max="3" value="2" oninput="document.getElementById('lbl-kafka').textContent=['Slow','Normal','Fast'][this.value-1]">
+      </div>
+
+      <div class="control-group">
+        <label>Rows per table per poll <span id="lbl-rows">20</span></label>
+        <input type="range" id="ctrl-rows" min="5" max="100" value="20" oninput="document.getElementById('lbl-rows').textContent=this.value">
+      </div>
+
+      <button class="sim-btn" id="sim-toggle" onclick="toggleSim()">▶ Start Simulation</button>
+    </div>
+
+    <div class="sim-display">
+      <div class="meter-row">
+        <div class="meter-label"><span>Queue 1 (poller → PG)</span><span id="m1-val">0</span></div>
+        <div class="meter-bar"><div class="meter-fill m-cyan" id="m1" style="width:0%"></div></div>
+      </div>
+      <div class="meter-row">
+        <div class="meter-label"><span>PostgreSQL raw_data (PENDING)</span><span id="m2-val">0</span></div>
+        <div class="meter-bar"><div class="meter-fill m-purple" id="m2" style="width:0%"></div></div>
+      </div>
+      <div class="meter-row">
+        <div class="meter-label"><span>Queue 2 (PG → Kafka)</span><span id="m3-val">0</span></div>
+        <div class="meter-bar"><div class="meter-fill m-green" id="m3" style="width:0%"></div></div>
+      </div>
+      <div class="meter-row">
+        <div class="meter-label"><span>S3_DONE (confirmed)</span><span id="m4-val">0</span></div>
+        <div class="meter-bar"><div class="meter-fill m-amber" id="m4" style="width:0%"></div></div>
+      </div>
+
+      <div class="offset-display">
+        <span class="label">offset_tracker.last_id</span>
+        <span class="value" id="offset-display">5180000</span>
+      </div>
+    </div>
+
+    <div class="sim-log" id="sim-log">
+      <div class="log-entry info">// Simulation ready. Press Start to begin.</div>
+    </div>
+  </div>
+</div>
+
+<script>
+// Tab switching
+function switchTab(name) {
+  document.querySelectorAll('.content').forEach(c => c.classList.remove('active'));
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.getElementById('tab-' + name).classList.add('active');
+  event.target.classList.add('active');
+}
+
+// Status panel
+const statusInfo = {
+  pending: {
+    color: 'var(--accent4)',
+    text: `<span style="color:var(--accent4)">PENDING_KAFKA</span> — Row is safely in PostgreSQL, waiting for Kafka producer.<br><br>
+Who sets it: <span style="color:var(--text)">pg_writer.py</span> on INSERT<br>
+What it means: Data is durable. Even if system crashes, it won't be lost.<br>
+Next action: Kafka producer picks it up via SELECT WHERE push_status='PENDING_KAFKA'`
+  },
+  sent: {
+    color: '#a78bfa',
+    text: `<span style="color:#a78bfa">KAFKA_SENT</span> — Row has been sent to Kafka topic, awaiting S3 confirmation.<br><br>
+Who sets it: <span style="color:var(--text)">kafka_producer.py</span> after successful send<br>
+What it means: In-flight. Kafka consumer is processing it.<br>
+Next action: Consumer writes parquet to S3, then confirms back.`
+  },
+  done: {
+    color: 'var(--accent3)',
+    text: `<span style="color:var(--accent3)">S3_DONE</span> — Row confirmed written to S3. This is the final state.<br><br>
+Who sets it: <span style="color:var(--text)">kafka_consumer.py</span> after S3 write confirmed<br>
+What it means: Data pipeline complete for this row. Safe to update offset.<br>
+Triggers: <span style="color:var(--accent1)">offset_tracker.last_id</span> updates to this row's source_id ✓`
+  }
+};
+
+function showStatus(key) {
+  const info = statusInfo[key];
+  document.getElementById('status-panel').innerHTML = 
+    `<span style="font-family:monospace;font-size:0.78rem;line-height:1.9;color:var(--muted)">${info.text}</span>`;
+}
+
+// Simulation
+let simRunning = false;
+let simInterval = null;
+let tick = 0;
+let offsetId = 5180000;
+let q1 = 0, q2 = 0, q3 = 0, s3done = 0;
+const maxQ = 5000;
+
+function log(msg, cls='') {
+  const el = document.getElementById('sim-log');
+  const entry = document.createElement('div');
+  entry.className = 'log-entry ' + cls;
+  const t = (tick * 0.5).toFixed(1);
+  entry.textContent = `[T=${t}s] ${msg}`;
+  el.appendChild(entry);
+  el.scrollTop = el.scrollHeight;
+}
+
+function updateMeters() {
+  const pct = v => Math.min(100, (v / maxQ) * 100);
+  document.getElementById('m1').style.width = pct(q1) + '%';
+  document.getElementById('m2').style.width = pct(q2) + '%';
+  document.getElementById('m3').style.width = pct(q3) + '%';
+  document.getElementById('m4').style.width = pct(s3done) + '%';
+  document.getElementById('m1-val').textContent = q1;
+  document.getElementById('m2-val').textContent = q2;
+  document.getElementById('m3-val').textContent = q3;
+  document.getElementById('m4-val').textContent = s3done;
+  document.getElementById('offset-display').textContent = offsetId.toLocaleString();
+}
+
+function simStep() {
+  tick++;
+  const tables = parseInt(document.getElementById('ctrl-tables').value);
+  const kafkaSpeed = parseInt(document.getElementById('ctrl-kafka').value);
+  const rowsPerTable = parseInt(document.getElementById('ctrl-rows').value);
+
+  // Every 120 ticks (60s) = poll
+  if (tick % 120 === 0) {
+    const newRows = Math.floor(tables * rowsPerTable * (0.8 + Math.random() * 0.4));
+    q1 += newRows;
+    log(`🔄 Poll fired. ${tables} tables × ~${rowsPerTable} rows = ${newRows} new rows → queue_1`, 'info');
+  }
+
+  // PG Writer: continuous, drains q1 → q2
+  const pgBatch = Math.min(q1, 500);
+  if (pgBatch > 0) {
+    q1 -= pgBatch;
+    q2 += pgBatch;
+  }
+
+  // Kafka Producer: continuous, drains q2 → q3, speed-dependent
+  const kafkaBatch = Math.min(q2, [50, 150, 400][kafkaSpeed - 1]);
+  if (kafkaBatch > 0) {
+    q2 -= kafkaBatch;
+    q3 += kafkaBatch;
+    if (tick % 20 === 0 && kafkaBatch > 0) {
+      log(`📨 Kafka sent ${kafkaBatch} rows to topic`, 'ok');
+    }
+  } else if (tick % 60 === 0 && q2 === 0 && q1 === 0) {
+    log(`⏳ Kafka idle — waiting for new rows`, '');
+  }
+
+  // S3 Consumer: drains q3 → done, updates offset
+  const s3Batch = Math.min(q3, [30, 100, 300][kafkaSpeed - 1]);
+  if (s3Batch > 0) {
+    q3 -= s3Batch;
+    s3done += s3Batch;
+    offsetId += s3Batch;
+    if (tick % 25 === 0) {
+      log(`✅ S3 confirmed ${s3Batch} rows. offset_tracker → ${offsetId.toLocaleString()}`, 'ok');
+    }
+  }
+
+  // Warn if q1 overflowing
+  if (q1 > maxQ * 0.8 && tick % 30 === 0) {
+    log(`⚠️ queue_1 filling up (${q1} rows buffered)`, 'warn');
+  }
+  if (kafkaSpeed === 1 && q2 > 1000 && tick % 40 === 0) {
+    log(`⚠️ Kafka slow — queue_2 backlogged (${q2} rows). No duplicates — PG is the buffer.`, 'warn');
+  }
+
+  updateMeters();
+}
+
+function toggleSim() {
+  const btn = document.getElementById('sim-toggle');
+  if (!simRunning) {
+    simRunning = true;
+    btn.textContent = '⏹ Stop Simulation';
+    btn.classList.add('stop');
+    tick = 0; q1 = 0; q2 = 0; q3 = 0; s3done = 0; offsetId = 5180000;
+    document.getElementById('sim-log').innerHTML = '<div class="log-entry info">// Simulation started — 60s poll cycle (500ms real-time ticks)</div>';
+    log('Pipeline initializing...', 'ok');
+    simInterval = setInterval(simStep, 500);
+  } else {
+    simRunning = false;
+    btn.textContent = '▶ Start Simulation';
+    btn.classList.remove('stop');
+    clearInterval(simInterval);
+    log('Simulation stopped.', 'warn');
+  }
+}
+</script>
+</body>
+</html>
